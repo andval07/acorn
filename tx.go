@@ -129,9 +129,9 @@ func (tx *Tx) Put(key, value []byte) error {
 		return fmt.Errorf("%w: key and value over %d bytes", ErrTooLarge, MaxEntrySize)
 	}
 	// The caller may reuse its buffers, so keep our own copies.
-	err := tx.insert(tx.meta.root, bytes.Clone(key), bytes.Clone(value), 0)
+	atEnd, err := tx.insert(tx.meta.root, bytes.Clone(key), bytes.Clone(value), 0)
 	if err == nil {
-		err = tx.fixRoot()
+		err = tx.fixRoot(atEnd)
 	}
 	return tx.fail(err)
 }
@@ -152,7 +152,7 @@ func (tx *Tx) Delete(key []byte) error {
 	}
 	found, err := tx.delete(tx.meta.root, key, 0)
 	if err == nil && found {
-		err = tx.fixRoot()
+		err = tx.fixRoot(false)
 	}
 	return tx.fail(err)
 }

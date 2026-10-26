@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -278,5 +279,68 @@ func TestPagesReused(t *testing.T) {
 	after, _ := db.Stats()
 	if after.Pages != before.Pages {
 		t.Fatalf("file grew from %d to %d pages", before.Pages, after.Pages)
+	}
+}
+
+// Keys inserted in order must fill pages well, not leave every leaf half
+// empty. Values of different sizes make the split points uneven.
+func TestSequentialFill(t *testing.T) {
+	for _, valSize := range []int{10, 100, 900} {
+		t.Run(fmt.Sprint("value", valSize), func(t *testing.T) {
+			db, _ := openTemp(t, fast)
+			const n = 20_000
+			model := map[string]string{}
+			data := 0
+			for start := 0; start < n; start += 1000 {
+				err := db.Update(func(tx *Tx) error {
+					for i := start; i < start+1000; i++ {
+						k := fmt.Sprintf("key%08d", i)
+						v := strings.Repeat("v", 1+i%valSize)
+						model[k] = v
+						data += leafCellSize([]byte(k), []byte(v))
+						if err := tx.Put([]byte(k), []byte(v)); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Check(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := db.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Pages 0 (meta) and internal nodes count too, so this is a
+			// lower bound on how full the leaves are.
+			fill := float64(data) / float64((s.Pages-1)*PageSize)
+			t.Logf("%d pages, fill %.0f%%", s.Pages, fill*100)
+			if fill < 0.70 {
+				t.Fatalf("pages only %.0f%% full after sequential insert", fill*100)
+			}
+
+			// The fuller pages must still merge and rebalance correctly.
+			err = db.Update(func(tx *Tx) error {
+				for i := 0; i < n; i += 3 {
+					k := fmt.Sprintf("key%08d", i)
+					delete(model, k)
+					if err := tx.Delete([]byte(k)); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Check(); err != nil {
+				t.Fatal(err)
+			}
+			compare(t, db, model)
+		})
 	}
 }

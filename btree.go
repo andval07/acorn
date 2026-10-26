@@ -10,32 +10,35 @@ import (
 // child's size and splits it (too big) or rebalances it with a sibling
 // (too small). The root has no parent, so fixRoot handles it last.
 
-func (tx *Tx) insert(id uint64, key, value []byte, depth int) error {
+// insert reports whether the key was added after every other key in the
+// tree. Splits use that to fill pages better when keys arrive in order.
+func (tx *Tx) insert(id uint64, key, value []byte, depth int) (atEnd bool, err error) {
 	if depth >= maxDepth {
-		return fmt.Errorf("%w: tree deeper than %d", ErrCorrupt, maxDepth)
+		return false, fmt.Errorf("%w: tree deeper than %d", ErrCorrupt, maxDepth)
 	}
 	n, err := tx.write(id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if n.leaf() {
 		i, found := n.search(key)
 		if found {
 			n.vals[i] = value
-		} else {
-			n.keys = slices.Insert(n.keys, i, key)
-			n.vals = slices.Insert(n.vals, i, value)
+			return false, nil
 		}
-		return nil
+		n.keys = slices.Insert(n.keys, i, key)
+		n.vals = slices.Insert(n.vals, i, value)
+		// Only the last leaf has no next leaf.
+		return i == len(n.keys)-1 && n.link == 0, nil
 	}
 	if n.kind != kindInternal {
-		return fmt.Errorf("%w: free page %d inside the tree", ErrCorrupt, id)
+		return false, fmt.Errorf("%w: free page %d inside the tree", ErrCorrupt, id)
 	}
 	ci := n.childIndex(key)
-	if err := tx.insert(n.children[ci], key, value, depth+1); err != nil {
-		return err
+	if atEnd, err = tx.insert(n.children[ci], key, value, depth+1); err != nil {
+		return false, err
 	}
-	return tx.fixChild(n, ci)
+	return atEnd, tx.fixChild(n, ci, atEnd)
 }
 
 // delete reports whether key was there. Pages are only copied for writing
@@ -71,18 +74,18 @@ func (tx *Tx) delete(id uint64, key []byte, depth int) (bool, error) {
 	if n, err = tx.write(id); err != nil {
 		return false, err
 	}
-	return true, tx.fixChild(n, ci)
+	return true, tx.fixChild(n, ci, false)
 }
 
 // fixChild splits or rebalances child ci of parent after it changed.
-func (tx *Tx) fixChild(parent *node, ci int) error {
+func (tx *Tx) fixChild(parent *node, ci int, atEnd bool) error {
 	child, err := tx.read(parent.children[ci])
 	if err != nil {
 		return err
 	}
 	switch {
 	case child.size() > PageSize:
-		return tx.split(parent, ci)
+		return tx.split(parent, ci, atEnd)
 	case child.size() < minFill && len(parent.children) > 1:
 		return tx.rebalance(parent, ci)
 	}
@@ -92,7 +95,12 @@ func (tx *Tx) fixChild(parent *node, ci int) error {
 // split moves the right half of child ci into a new node and adds the
 // separator key to the parent. The parent may now be too big itself;
 // its own parent fixes that on the next step up.
-func (tx *Tx) split(parent *node, ci int) error {
+//
+// A split in the middle leaves both halves half full. When keys arrive in
+// order (atEnd), the left half never gets another key, so the tree would
+// stay half empty. In that case the left node keeps as much as it can and
+// the new right node starts with the minimum, like SQLite does for appends.
+func (tx *Tx) split(parent *node, ci int, atEnd bool) error {
 	left, err := tx.write(parent.children[ci])
 	if err != nil {
 		return err
@@ -101,7 +109,11 @@ func (tx *Tx) split(parent *node, ci int) error {
 	if err != nil {
 		return err
 	}
-	sep := splitInto(left, right)
+	m := left.splitPoint()
+	if atEnd {
+		m = left.appendSplitPoint()
+	}
+	sep := splitInto(left, right, m)
 	if left.size() > PageSize || right.size() > PageSize {
 		return fmt.Errorf("acorn: split of page %d left a node too big", left.id)
 	}
@@ -110,10 +122,9 @@ func (tx *Tx) split(parent *node, ci int) error {
 	return nil
 }
 
-// splitInto moves the upper half of left into right (which must be empty)
-// and returns the key that separates them in the parent.
-func splitInto(left, right *node) []byte {
-	m := left.splitPoint()
+// splitInto moves the cells from m on out of left into right (which must
+// be empty) and returns the key that separates them in the parent.
+func splitInto(left, right *node, m int) []byte {
 	if left.leaf() {
 		right.keys = slices.Clone(left.keys[m:])
 		right.vals = slices.Clone(left.vals[m:])
@@ -170,7 +181,7 @@ func (tx *Tx) rebalance(parent *node, ci int) error {
 	}
 
 	*right = node{id: right.id, kind: right.kind}
-	parent.keys[li] = splitInto(left, right)
+	parent.keys[li] = splitInto(left, right, left.splitPoint())
 	return nil
 }
 
@@ -178,7 +189,7 @@ func (tx *Tx) rebalance(parent *node, ci int) error {
 // a new root, so the tree grows at the top and all leaves stay at the
 // same depth. An internal root left with one child is removed, which is
 // how the tree gets shorter.
-func (tx *Tx) fixRoot() error {
+func (tx *Tx) fixRoot(atEnd bool) error {
 	root, err := tx.read(tx.meta.root)
 	if err != nil {
 		return err
@@ -190,7 +201,7 @@ func (tx *Tx) fixRoot() error {
 		}
 		newRoot.children = []uint64{root.id}
 		tx.meta.root = newRoot.id
-		return tx.split(newRoot, 0)
+		return tx.split(newRoot, 0, atEnd)
 	}
 	if root.kind == kindInternal && len(root.keys) == 0 {
 		tx.meta.root = root.children[0]

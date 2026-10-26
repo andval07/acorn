@@ -2,7 +2,7 @@
 
 An embedded key-value store in Go, built from scratch: a **B+tree** on 4 KB
 pages, a **write-ahead log** for crash safety, and a free list so deleted pages
-are reused. Standard library only. About 1,300 lines of engine code and 830
+are reused. Standard library only. About 1,400 lines of engine code and 900
 lines of tests.
 
 ```go
@@ -84,6 +84,7 @@ copies. Rolling back means dropping that map; nothing shared was touched.
 fixes the child it went into:
 
 - a child bigger than a page is split in two, and the separator key moves up;
+  usually in the middle, but see below for keys that arrive in order;
 - a child under a quarter of a page is merged with a sibling if the two fit in
   one page, otherwise the two are split again evenly;
 - a root that overflows gets a new root above it; an internal root left with
@@ -91,6 +92,15 @@ fixes the child it went into:
 
 The size limits keep every cell under a quarter of a page, so a node always
 holds at least four cells and a split always produces two valid nodes.
+
+**Splits for sequential keys.** If every split cut the node in the middle,
+keys that arrive in order would leave each left half untouched forever, and
+all leaves would stay about half full. So when the new key went to the end of
+the last leaf, the split gives the right node only enough cells to reach a
+quarter of a page (the minimum `Check()` allows) and keeps the rest on the
+left. The same rule applies to the internal nodes on the right edge. SQLite
+does something similar for appends. With 100k keys in order the tree now uses
+4,039 pages instead of 6,336, a bit fewer than the 4,375 of random order.
 
 **WAL.** A commit appends one frame per changed page, then the meta page with
 a commit flag, in a single write followed by fsync. Each frame is a full page
@@ -113,7 +123,7 @@ commit that triggered it: that commit is already safe in the WAL.
 ## Tests
 
 ```
-go test ./...              # about 15 s, coverage 84%
+go test ./...              # about 15 s, coverage 86%
 go test -short ./...       # skips the process-kill test
 go test -bench . -run ^$   # micro-benchmarks
 ```
@@ -136,6 +146,9 @@ go test -bench . -run ^$   # micro-benchmarks
   (three times), reopens the file and checks that every acknowledged commit
   is there and that the keys have no gaps.
 - **Page reuse.** Delete everything, refill, and the file does not grow.
+- **Sequential fill.** 20,000 keys in order, with three value sizes, must fill
+  pages at least 70% (they reach 72–74%; the old middle split gave 49%). Then a
+  third of the keys are deleted and the tree is checked against the model.
 - Node encoding round trips, and decoding of damaged pages returns
   `ErrCorrupt` instead of panicking.
 
@@ -154,14 +167,17 @@ cd bench && go run . -runs 5
 Measured on an Intel i9-13950HX laptop with an NVMe SSD, Windows 11, Go 1.27.
 Each run reports the median of several repetitions; the table shows the lowest
 and highest median over three runs, because the numbers move between runs.
+An earlier set of runs on the same laptop gave about half these numbers for
+both engines, so the power state of the machine matters as much as the code.
+Compare the two columns, not the absolute values.
 
 | workload | acorn | SQLite |
 |---|---:|---:|
-| insert 100k sequential keys, 1 tx | 744k – 823k keys/s | 435k – 471k keys/s |
-| insert 100k random keys, 1 tx | 790k – 895k keys/s | 174k – 444k keys/s |
-| get, random keys | 461k – 1.12M ops/s | 79k – 80k ops/s |
-| full range scan | 4.87M – 6.27M keys/s | 1.19M – 1.48M keys/s |
-| 1000 commits of 1 key, fsync each | 1.4k – 1.5k commits/s | 1.4k – 1.5k commits/s |
+| insert 100k sequential keys, 1 tx | 827k – 961k keys/s | 406k – 439k keys/s |
+| insert 100k random keys, 1 tx | 601k – 848k keys/s | 376k – 407k keys/s |
+| get, random keys | 940k – 1.02M ops/s | 193k – 209k ops/s |
+| full range scan | 12.5M – 14.4M keys/s | 2.61M – 2.79M keys/s |
+| 1000 commits of 1 key, fsync each | 2.8k – 3.0k commits/s | 2.6k – 2.9k commits/s |
 
 How to read this honestly:
 
@@ -173,7 +189,7 @@ How to read this honestly:
   and runs SQL through its virtual machine, and handles types. acorn is a
   direct function call into the tree. Most of the gap on reads comes from
   that, not from a better B-tree.
-- Small synced commits are the same for both, about 0.7 ms each. That is the
+- Small synced commits are about the same for both, about 0.35 ms each. That is the
   cost of fsync on this disk, and neither engine can go faster than the disk.
 
 ## Limitations
@@ -183,12 +199,9 @@ How to read this honestly:
   There is no MVCC.
 - **No overflow pages.** Values over about 1 KB are rejected instead of being
   split across pages.
-- **Half-full leaves on sequential insert.** A split always cuts a node in the
-  middle. When keys arrive in order, the left half is never touched again, so
-  leaves stay about half full: 100k sequential keys use 6,336 pages against
-  4,375 for the same keys in random order. SQLite avoids this with a split
-  that puts almost everything on the left when the insert is at the right
-  edge. That would be the next improvement.
+- **Descending keys still split in the middle.** The split above only looks
+  at the right edge. Keys inserted in reverse order leave leaves about half
+  full: 5,632 pages for the same 100k keys.
 - **Crash testing has limits.** The kill test proves that a process crash
   loses no acknowledged commit. A power cut also drops the operating system's
   write cache. Only fsync protects against that, and a test cannot reproduce

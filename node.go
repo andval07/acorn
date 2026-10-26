@@ -208,3 +208,31 @@ func (n *node) splitPoint() int {
 	}
 	return max(1, min(len(n.keys)/2, last))
 }
+
+// appendSplitPoint is splitPoint for keys that arrive in order: the right
+// half gets just enough cells to reach minFill, and the left keeps the
+// rest. It falls back to splitPoint if the left half would not fit.
+func (n *node) appendSplitPoint() int {
+	used := headerSize
+	for m := len(n.keys) - 1; m >= 1; m-- {
+		// In an internal node key m moves up, so the right half starts
+		// at m+1; its leftmost child needs no key of its own.
+		if n.leaf() {
+			used += leafCellSize(n.keys[m], n.vals[m])
+		} else if m+1 < len(n.keys) {
+			used += innerCellSize(n.keys[m+1])
+		}
+		if used < minFill {
+			continue
+		}
+		left := n.size() - used + headerSize
+		if !n.leaf() {
+			left -= innerCellSize(n.keys[m]) // the separator moves up
+		}
+		if left <= PageSize {
+			return m
+		}
+		break
+	}
+	return n.splitPoint()
+}
