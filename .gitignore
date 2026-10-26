@@ -1,0 +1,6 @@
+# personal interview notes, not part of the project
+SPIEGAZIONE.md
+*.acorn
+*.acorn-wal
+/acorn.exe
+coverage.out
